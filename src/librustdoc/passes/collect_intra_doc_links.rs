@@ -2023,65 +2023,128 @@ fn resolution_failure(
             };
             // ignore duplicates
             let mut variants_seen = SmallVec::<[_; 3]>::new();
-            for mut failure in kinds {
+            for failure in kinds {
                 let variant = mem::discriminant(&failure);
                 if variants_seen.contains(&variant) {
                     continue;
                 }
                 variants_seen.push(variant);
 
-                if let ResolutionFailure::NotResolved(UnresolvedPath {
-                    item_id,
-                    module_id,
-                    partial_res,
-                    unresolved,
-                }) = &mut failure
-                {
+                if let ResolutionFailure::NotResolved(mut failure) = failure {
                     use DefKind::*;
 
-                    let item_id = *item_id;
-                    let module_id = *module_id;
+                    let attach_extra_note = |diag: &mut Diag<'_, ()>| {
+                        if !path_str.contains("::") {
+                            if disambiguator.is_none_or(|d| d.ns() == MacroNS)
+                                && collector
+                                    .cx
+                                    .tcx
+                                    .resolutions(())
+                                    .all_macro_rules
+                                    .contains(&Symbol::intern(path_str))
+                            {
+                                diag.note(format!(
+                                    "`macro_rules` named `{path_str}` exists in this crate, \
+                                    but it is not in scope at this link's location"
+                                ));
+                            } else {
+                                // If the link has `::` in it, assume it was meant to be an
+                                // intra-doc link. Otherwise, the `[]` might be unrelated.
+                                diag.help(
+                                    "to escape `[` and `]` characters, \
+                                    add '\\' before them like `\\[` or `\\]`",
+                                );
+                            }
+                        }
+                    };
 
                     // Check if _any_ parent of the path gets resolved.
                     // If so, report it and say the first which failed; if not, say the first path segment didn't resolve.
-                    let mut name = path_str;
-                    'outer: loop {
-                        // FIXME(jynelson): this might conflict with my `Self` fix in #76467
-                        let Some((start, end)) = name.rsplit_once("::") else {
-                            // `name` is now the first path segment, which didn't resolve.
-                            // avoid bug that marked [Quux::Z] as missing Z, not Quux
-                            if partial_res.is_none() {
-                                *unresolved = name.into();
+                    // If `path_str` is an invalid path, this closure returns `None`.
+                    let try_resolve_parent = || -> Option<UnresolvedPath<'_>> {
+                        let mut is_invalid_segment = |segment: &str| {
+                            // Examples of `path_str` that are invalid:
+                            // - "std::::path", during splitting this would yield an empty segment
+                            // - "std:::path", this would eventually yield "std:"
+                            if segment.is_empty() || segment.contains(':') {
+                                let note = "has invalid path separator";
+                                if let Some(span) = sp {
+                                    diag.span_label(span, note);
+                                } else {
+                                    diag.note(note);
+                                }
+                                true
+                            } else {
+                                false
                             }
-                            break;
                         };
-                        for ns in [TypeNS, ValueNS, MacroNS] {
-                            if let Ok(v_res) =
-                                collector.resolve(start, ns, None, item_id, module_id)
-                            {
-                                debug!("found partial_res={v_res:?}");
-                                if let Some(&res) = v_res.first() {
-                                    *partial_res = Some(full_res(tcx, res));
-                                    *unresolved = end.into();
-                                    break 'outer;
+
+                        let UnresolvedPath {
+                            item_id,
+                            module_id,
+                            ref mut partial_res,
+                            ref mut unresolved,
+                        } = failure;
+
+                        let mut path = path_str;
+                        loop {
+                            // FIXME(jynelson): this might conflict with my `Self` fix in #76467
+                            let Some((parent, segment)) = path.rsplit_once("::") else {
+                                // `path` is now the first path segment, which didn't resolve.
+                                // avoid bug that marked [Quux::Z] as missing Z, not Quux
+                                if is_invalid_segment(path) {
+                                    return None;
+                                }
+                                if partial_res.is_none() {
+                                    *unresolved = path.into();
+                                    // If `partial_res` somehow had a value, we preserve the original `unresolved`.
+                                }
+                                return Some(failure);
+                            };
+
+                            if is_invalid_segment(segment) {
+                                // If any segment is invalid, stop and say so, instead of saying
+                                // "no item named ...", which would look nonsensical.
+                                return None;
+                            }
+
+                            for ns in [TypeNS, ValueNS, MacroNS] {
+                                if let Ok(res) =
+                                    collector.resolve(parent, ns, None, item_id, module_id)
+                                {
+                                    debug!("found partial_res={res:?}");
+                                    if let Some(&res) = res.first() {
+                                        *partial_res = Some(full_res(tcx, res));
+                                        *unresolved = segment.into();
+                                        return Some(failure);
+                                    }
                                 }
                             }
-                        }
-                        *unresolved = end.into();
-                        if start.is_empty() && partial_res.is_none() {
-                            // `start` being empty means `path_str` was written like "::path::to::item".
-                            // In this case, `end` is the first path segment that we should report.
-                            break;
-                        }
-                        name = start;
-                    }
 
-                    let last_found_module = match *partial_res {
+                            if parent.is_empty() && partial_res.is_none() {
+                                // `parent` being empty means `path_str` was written like "::path::to::item".
+                                // In this case, `segment` is the first path segment that we should report.
+                                *unresolved = segment.into();
+                                return Some(failure);
+                            }
+
+                            path = parent;
+                        }
+                    };
+
+                    let Some(UnresolvedPath { item_id: _, module_id, partial_res, unresolved }) =
+                        try_resolve_parent()
+                    else {
+                        attach_extra_note(diag);
+                        continue;
+                    };
+
+                    // See if this was a module: `[path]` or `[std::io::nope]`
+                    let last_found_module = match partial_res {
                         Some(Res::Def(DefKind::Mod, id)) => Some(id),
                         None => Some(module_id),
                         _ => None,
                     };
-                    // See if this was a module: `[path]` or `[std::io::nope]`
                     if let Some(module) = last_found_module {
                         let note = if partial_res.is_some() {
                             // Part of the link resolved; e.g. `std::io::nonexistent`
@@ -2097,29 +2160,7 @@ fn resolution_failure(
                             diag.note(note);
                         }
 
-                        if !path_str.contains("::") {
-                            if disambiguator.is_none_or(|d| d.ns() == MacroNS)
-                                && collector
-                                    .cx
-                                    .tcx
-                                    .resolutions(())
-                                    .all_macro_rules
-                                    .contains(&Symbol::intern(path_str))
-                            {
-                                diag.note(format!(
-                                    "`macro_rules` named `{path_str}` exists in this crate, \
-                                     but it is not in scope at this link's location"
-                                ));
-                            } else {
-                                // If the link has `::` in it, assume it was meant to be an
-                                // intra-doc link. Otherwise, the `[]` might be unrelated.
-                                diag.help(
-                                    "to escape `[` and `]` characters, \
-                                           add '\\' before them like `\\[` or `\\]`",
-                                );
-                            }
-                        }
-
+                        attach_extra_note(diag);
                         continue;
                     }
 
@@ -2195,6 +2236,7 @@ fn resolution_failure(
                     } else {
                         "associated item"
                     };
+
                     let name = res.name(tcx);
                     let note = format!(
                         "the {res} `{name}` has no {disamb_res} named `{unresolved}`",
@@ -2206,9 +2248,9 @@ fn resolution_failure(
                     } else {
                         diag.note(note);
                     }
-
                     continue;
                 }
+
                 let note = match failure {
                     ResolutionFailure::NotResolved { .. } => unreachable!("handled above"),
                     ResolutionFailure::WrongNamespace { res, expected_ns } => {
