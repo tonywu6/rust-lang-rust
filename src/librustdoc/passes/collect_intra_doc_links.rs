@@ -2196,7 +2196,7 @@ fn resolution_failure(
                                 } else {
                                     diag.note(note);
                                 }
-                                return;
+                                continue;
                             }
                             Variant
                             | Field
@@ -2220,7 +2220,7 @@ fn resolution_failure(
                                 } else {
                                     diag.note(note);
                                 }
-                                return;
+                                continue;
                             }
                             Trait
                             | TyAlias
